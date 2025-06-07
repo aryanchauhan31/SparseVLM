@@ -12,8 +12,45 @@ class SparseVLMModel(nn.Module):
         self.language_model.config.hidden_size
     )
     self.top_k = top_k
-    self.vision_hidden_size = self.vision_encoder.config_hidden_size
-    self.text_hidden_size = self.language_model.config_hidden_size
+    self.vision_hidden_size = self.vision_encoder.config.hidden_size
+    self.text_hidden_size = self.language_model.config.hidden_size
+
+  def recycle_and_cluster(self, deleted_tokens, deleted_scores, tau=0.5, theta=0.5):
+    if deleted_tokens.size(0) < 1:
+      return None
+    
+    num_recycle = int(tau*deleted_tokens.size(0))
+    if num_recycle < 1:
+      return None 
+    
+    recycle_idx = torch.topk(deleted_scores, num_recycle).indices
+    recycled_tokens = deleted_tokens[recycle_idx]
+
+    num_clusters = max(1, int(theta * num_recycle))
+
+    recycled_norm = torch.nn.functional.normalised(recycled_tokens, dim=-1)
+
+    centers = [recycled_norm[0]]
+    for _ in range(1, num_clusters):
+      dists = torch.stack([
+          1 - torch.matmul(recycled_norm, c.unsqueeze(-1)).squeeze(-1)
+          for c in centers
+      ], dim=1).min(dim=1).values
+      next_center = recycled_norm[dists.argmax()]
+      centers.append(next_center)
+
+    assignments = torch.stack([
+        torch.matmul(recycled_norm, c.unsqueeze(-1)).squeeze(-1)
+        for c in centers
+    ],dim=1).argmax(dim=1)
+
+    aggregated = []
+    for k in range(num_clusters):
+        members = recycled_tokens[assignments == k]
+        if members.size(0) > 0:
+            aggregated.append(members.sum(dim=0))
+    
+    return torch.stack(aggregated) if aggregated else None
 
   def forward(self, pixel_values, input_ids, labels=None):
     vision_outputs = self.vision_encoder(pixel_values=pixel_values)
@@ -44,20 +81,35 @@ class SparseVLMModel(nn.Module):
     prune_counts = (lambda_factor * (Lv-ranks)).init()
     batch_size = patch_tokens.size(0)
     
-    top_masked_indices = []
+    topk_masked_tokens= []
     for i in range(batch_size):
-      N = prune_counts[i].item()
-      K = Lv - N
-      scores = vision_scores[i]
-      topk_idx = torch.topk(scores, K).indices
-      top_masked_indices.append(topk_idx)
+        N = prune_counts[i].item()
+        K = Lv - N
 
-    topk_tokens = torch.stack([
-        patch_tokens[i, top_masked_indices[i]] for i in range(batch_size)
-    ])
+        scores = vision_scores[i]
+        topk_idx = torch.topk(scores, K).indices
+
+        all_idx = torch.arange(Lv, device=scores.device)
+        deleted_mask = torch.ones_like(all_idx, dtype=torch.bool)
+        deleted_mask[topk_idx] = False
+        deleted_idx = all_idx[deleted_mask]
+
+        deleted_tokens = patch_tokens[i, deleted_idx]
+        deleted_scores = scores[deleted_idx]
+
+        # Token recycling
+        aggregated_tokens = self.recycle_and_cluster(deleted_tokens, deleted_scores)
+
+        # Merge topk + aggregated
+        selected_tokens = patch_tokens[i, topk_idx]
+        if aggregated_tokens is not None:
+            selected_tokens = torch.cat([selected_tokens, aggregated_tokens], dim=0)
+
+        topk_masked_tokens.append(selected_tokens)
+
+    topk_tokens = torch.stack(topk_masked_tokens)  
 
     visual_embeds = self.vision_proj(topk_tokens)
-    
     input_embeds = self.language_model.model.embed_tokens(input_ids)
     combined_embeds = torch.cat([visual_embeds, input_embeds], dim=1)
 
