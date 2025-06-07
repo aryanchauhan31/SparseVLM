@@ -11,10 +11,6 @@ class SparseVLMModel(nn.Module):
         self.vision_encoder.config.hidden_size,
         self.language_model.config.hidden_size
     )
-    # self.token_scorer = nn.Sequential(
-    #     nn.LayerNorm(self.vision_encoder.config.hidden_size),
-    #     nn.Linear(self.vision_encoder.config.hidden_size, 1)
-    # )
     self.top_k = top_k
     self.vision_hidden_size = self.vision_encoder.config_hidden_size
     self.text_hidden_size = self.language_model.config_hidden_size
@@ -38,10 +34,26 @@ class SparseVLMModel(nn.Module):
     Attn_softmax = Attn_softmax*raters_mask 
     vision_scores = Attn_softmax.sum(dim=-1)/raters_mask.sum(dim=-1).clamp(min=1e-5)
 
-    topk_indices = torch.topk(vision_scores, self.top_k, dim=1).indices
+    P = Attn_softmax.transpose(1,2)
+    ranks = torch.stack([
+        torch.linalg.matrix_rank(P[i]) for i in range(P.size(0))
+    ])
+
+    lambda_factor = 0.5
+    Lv = patch_tokens.size(1)
+    prune_counts = (lambda_factor * (Lv-ranks)).init()
     batch_size = patch_tokens.size(0)
+    
+    top_masked_indices = []
+    for i in range(batch_size):
+      N = prune_counts[i].item()
+      K = Lv - N
+      scores = vision_scores[i]
+      topk_idx = torch.topk(scores, K).indices
+      top_masked_indices.append(topk_idx)
+
     topk_tokens = torch.stack([
-        patch_tokens[i, topk_indices[i]] for i in range(batch_size)
+        patch_tokens[i, top_masked_indices[i]] for i in range(batch_size)
     ])
 
     visual_embeds = self.vision_proj(topk_tokens)
