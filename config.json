@@ -1,0 +1,17 @@
+{
+  "_name_or_path": "SparseVLM",
+  "architectures": ["SparseVLMModel"],
+  "model_type": "llama",
+  "base_language_model": "meta-llama/Llama-3.1-8B",
+  "vision_encoder_model": "openai/clip-vit-base-patch16",
+  "torch_dtype": "float16",
+  "use_cache": true,
+  "tie_word_embeddings": false,
+  "vocab_size": 32000,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "pad_token_id": 0,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 32
+}
