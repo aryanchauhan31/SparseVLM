@@ -5,10 +5,11 @@ from torch.utils.data import Dataset
 from transformers import CLIPImageProcessor, AutoTokenizer
 
 class COCODataset(Dataset):
-    def __init__(self, image_dir, annotation_file, tokenizer_name="meta-llama/Llama-3.1-8B", image_processor_name="openai/clip-vit-base-patch16", max_length=128):
+    def __init__(self, image_dir, annotation_file, tokenizer_name="EleutherAI/gpt-neo-125M", image_processor_name="openai/clip-vit-base-patch16", max_length=128):
         self.image_dir = image_dir
         self.annotation_file = annotation_file
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         self.image_processor = CLIPImageProcessor.from_pretrained(image_processor_name)
         self.max_length = max_length
 
@@ -38,7 +39,7 @@ class COCODataset(Dataset):
         encoding = self.tokenizer(caption, padding="max_length", max_length=self.max_length, truncation=True, return_tensors="pt")
         input_ids = encoding.input_ids.squeeze(0)
         labels = input_ids.clone()
-        labels[labels == self.tokenizer.pad_token_id] = -100  # mask padding in loss
+        labels[labels == self.tokenizer.pad_token_id] = -100
 
         return {
             "pixel_values": pixel_values,
