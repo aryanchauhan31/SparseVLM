@@ -1,99 +1,75 @@
+import os
 import torch
-from torch.utils.data import DataLoader
-import deepspeed
-from transformers import AutoTokenizer
-import mpi4py
-from deepspeed.ops.adam import DeepSpeedCPUAdam
-from transformers import get_scheduler
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
+import tempfile
 
-# Optional: wandb logging
-use_wandb = False
-if use_wandb:
-    import wandb
-    wandb.init(project="sparsevlm-coco")
+def main(rank=0, world_size=1):
+    # ==== Distributed init ====
+    temp_dir = tempfile.mkdtemp()
+    init_method = f"file://{temp_dir}/sharedfile"
+    dist.init_process_group(
+        backend='nccl',
+        init_method=init_method,
+        world_size=world_size,
+        rank=rank,
+    )
+    # ==== Dataset & Loader ====
+    dataset = COCODataset(
+        image_dir="train2017",
+        annotation_file="annotations/captions_train2017.json"
+    )
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=64, sampler=sampler, num_workers=4)
 
-# === Dataset + Loader ===
-dataset = COCODataset(
-    image_dir="train2017",
-    annotation_file="/content/annotations/captions_train2017.json"
-)
-dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    # ==== Model & Optimizer ====
+    torch.cuda.set_device(rank)
+    model = SparseVLMModel().cuda(rank)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)  # <-- robust for unused params
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
-# === Model & Optimizer ===
-model = SparseVLMModel()
-optimizer = deepspeed.ops.adam.DeepSpeedCPUAdam(model.parameters(), lr=5e-5)
+    # ==== Training Loop ====
+    for epoch in range(1):
+        model.train()
+        sampler.set_epoch(epoch)
+        epoch_loss = 0.0
 
-# === DeepSpeed Config ===
-ds_config = {
-    "train_batch_size": 2,
-    "gradient_accumulation_steps": 1,
-    "fp16": {
-        "enabled": True
-    },
-    "zero_optimization": {
-        "stage": 2,
-        "offload_optimizer": {
-            "device": "cpu"
-      }
-    },
-    "optimizer": {
-        "type": "DeepSpeedCPUAdam",
-        "params": {
-            "lr": 5e-6,
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
-            "weight_decay": 0.01
-        }
-    },
-    "lr_scheduler": {
-        "type": "WarmupLR",
-        "params": {
-            "warmup_min_lr": 0,
-            "warmup_max_lr": 5e-5,
-            "warmup_num_steps": 100
-        }
-    },
-    "gradient_clipping": 1.0
-}
+        for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", disable=(rank != 0))):
+            pixel_values = batch["pixel_values"].cuda(rank, non_blocking=True)
+            input_ids = batch["input_ids"].cuda(rank, non_blocking=True)
+            labels = batch["labels"].cuda(rank, non_blocking=True)
 
+            outputs = model(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-# === DeepSpeed Initialize ===
-model_engine, optimizer, _, _ = deepspeed.initialize(
-    model=model,
-    optimizer=optimizer,
-    config=ds_config
-)
+            epoch_loss += loss.item()
 
+        # Aggregate loss across processes for printing
+        total_loss = torch.tensor(epoch_loss, device=rank)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        avg_loss = total_loss.item() / world_size / len(dataloader)
+        if rank == 0:
+            print(f"[Epoch {epoch+1}] Average Loss: {avg_loss:.4f}")
 
-# === Training Loop ===
-for epoch in range(5):
-    model_engine.train()
-    epoch_loss = 0.0
+        # Save checkpoint from rank 0 only
+        if rank == 0:
+            save_dir = f"./sparsevlm_checkpoint_epoch{epoch+1}"
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(model.module.state_dict(), os.path.join(save_dir, "model.pt"))
 
-    for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
-        pixel_values = batch["pixel_values"].to(model_engine.device)
-        input_ids = batch["input_ids"].to(model_engine.device)
-        labels = batch["labels"].to(model_engine.device)
+    dist.destroy_process_group()
 
-        outputs = model_engine(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            labels=labels
-        )
-        loss = outputs.loss
-        model_engine.backward(loss)
-        torch.nn.utils.clip_grad_norm_(model_engine.parameters(), max_norm=1.0)
-        model_engine.step()
+if __name__ == "__main__":
+    # For multi-GPU: use mp.spawn OR torchrun
+    # world_size = torch.cuda.device_count()
+    # mp.spawn(main, args=(world_size,), nprocs=world_size)
 
-        epoch_loss += loss.item()
-        if use_wandb:
-            wandb.log({"train/loss": loss.item(), "step": step + epoch * len(dataloader)})
-
-    avg_loss = epoch_loss / len(dataloader)
-    print(f"[Epoch {epoch+1}] Average Loss: {avg_loss:.4f}")
-
-    # === Save checkpoint ===
-    save_dir = f"./sparsevlm_checkpoint_epoch{epoch+1}"
-    model_engine.save_checkpoint(save_dir)
-
+    # For single-GPU (Jupyter/Notebook), debug:
+    main(rank=0, world_size=1)
